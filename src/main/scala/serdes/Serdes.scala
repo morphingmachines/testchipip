@@ -158,24 +158,35 @@ class PhitArbiter(phitWidth: Int, flitWidth: Int, channels: Int) extends Module 
     val headerBeats = (headerWidth - 1) / phitWidth + 1
     val flitBeats = (flitWidth - 1) / phitWidth + 1
     val beats = headerBeats + flitBeats
-    val beat = RegInit(0.U(log2Ceil(beats).W))
-    val chosen_reg = Reg(UInt(headerWidth.W))
-    val chosen_prio = PriorityEncoder(io.in.map(_.valid))
-    val chosen = Mux(beat === 0.U, chosen_prio, chosen_reg)
+    val beat =          withReset(reset.asAsyncReset) {RegInit(0.U(log2Ceil(beats).W)) }
+    val chosenReg =     withReset(reset.asAsyncReset) {RegInit(0.U(headerWidth.W)) }
+    val chosenFlitReg = withReset(reset.asAsyncReset) {RegInit(0.U(flitWidth.W)) }
+    val rrOutVldReg =   withReset(reset.asAsyncReset) {RegInit(0.U(1.W)) }
+    val OutVldReg =   withReset(reset.asAsyncReset) {RegInit(0.U(1.W)) }
+    val outBitsReg =    withReset(reset.asAsyncReset) {RegInit(0.U(flitWidth.W)) }
+    val rrOutVld =      Wire(UInt(1.W))
+    // Use Chisel's RRArbiter for round-robin selection
+    val rr_arb = Module(new RRArbiter(new Phit(phitWidth), channels))
+    rr_arb.io.in <> io.in
+    rrOutVld := Mux(beat < headerBeats.U, rr_arb.io.out.valid, rrOutVldReg) 
+    val chosen = Mux(beat < headerBeats.U, rr_arb.io.chosen, chosenReg)
     val header_idx = if (headerBeats == 1) 0.U else beat(log2Ceil(headerBeats)-1,0)
-
-    io.out.valid := VecInit(io.in.map(_.valid))(chosen)
-    io.out.bits.phit := Mux(beat < headerBeats.U,
-      chosen.asTypeOf(Vec(headerBeats, UInt(phitWidth.W)))(header_idx),
-      VecInit(io.in.map(_.bits.phit))(chosen))
-
-    for (i <- 0 until channels) {
-      io.in(i).ready := io.out.ready && beat >= headerBeats.U && chosen_reg === i.U
+    withReset(reset.asAsyncReset) {
+      chosenFlitReg := Mux(beat < headerBeats.U, rr_arb.io.out.bits.phit, chosenFlitReg)  
+      rrOutVldReg := rr_arb.io.out.valid
+      OutVldReg := rrOutVld
+      outBitsReg := Mux(beat < headerBeats.U,
+        chosen.asTypeOf(Vec(headerBeats, UInt(phitWidth.W)))(header_idx),
+        chosenFlitReg)
     }
-
-    when (io.out.fire) {
-      beat := Mux(beat === (beats-1).U, 0.U, beat + 1.U)
-      when (beat === 0.U) { chosen_reg := chosen_prio }
+    io.out.valid := OutVldReg
+    io.out.bits.phit := outBitsReg
+    rr_arb.io.out.ready := io.out.ready && (beat < headerBeats.U)
+    withReset(reset.asAsyncReset) {
+      when (io.out.ready && (rrOutVld.asBool)) {
+        beat := withReset(reset.asAsyncReset){ Mux(beat === (beats-1).U, 0.U, beat + 1.U) }
+        when (beat === 0.U) { chosenReg := rr_arb.io.chosen }
+      }
     }
   }
 }
@@ -207,7 +218,7 @@ class PhitDemux(phitWidth: Int, flitWidth: Int, channels: Int) extends Module {
     when (io.in.fire) {
       beat := Mux(beat === (beats-1).U, 0.U, beat + 1.U)
       when (beat < headerBeats.U) {
-        channel_vec(header_idx) := io.in.bits.phit
+        withReset(reset.asAsyncReset){ channel_vec(header_idx) := bitsReg}
       }
     }
   }
