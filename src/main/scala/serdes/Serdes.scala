@@ -204,26 +204,34 @@ class PhitDemux(phitWidth: Int, flitWidth: Int, channels: Int) extends Module {
     val headerBeats = (headerWidth - 1) / phitWidth + 1
     val flitBeats = (flitWidth - 1) / phitWidth + 1
     val beats = headerBeats + flitBeats
-    val beat = RegInit(0.U(log2Ceil(beats).W))
-    val channel_vec = Reg(Vec(headerBeats, UInt(phitWidth.W)))
+    val beat = withReset(reset.asAsyncReset){RegInit(0.U(log2Ceil(beats).W)) }
+
+    require(headerBeats >= 1, "headerBeats must be at least 1")
+    // Initialize channel_vec with 0 and use async reset
+    val channel_vec = withReset(reset.asAsyncReset) { RegInit(VecInit(Seq.fill(math.max(headerBeats, 1))(0.U(phitWidth.W)))) }
+    //val channel_vec = Reg(Vec(math.max(headerBeats, 1), UInt(phitWidth.W)))
     val channel = channel_vec.asUInt(log2Ceil(channels)-1,0)
     val header_idx = if (headerBeats == 1) 0.U else beat(log2Ceil(headerBeats)-1,0)
-
+    val validReg =withReset(reset.asAsyncReset) {RegInit(false.B)}
+    val bitsReg = withReset(reset.asAsyncReset) {RegInit(0.U(phitWidth.W))}
+    withReset(reset.asAsyncReset) {
+      validReg := io.in.valid
+      bitsReg := io.in.bits.phit
+    }
     io.in.ready := beat < headerBeats.U || VecInit(io.out.map(_.ready))(channel)
     for (c <- 0 until channels) {
-      io.out(c).valid := io.in.valid && beat >= headerBeats.U && channel === c.U
-      io.out(c).bits.phit := io.in.bits.phit
+      io.out(c).valid := validReg && beat >= headerBeats.U && channel === c.U
+      io.out(c).bits.phit := bitsReg
     }
 
-    when (io.in.fire) {
-      beat := Mux(beat === (beats-1).U, 0.U, beat + 1.U)
+    when (validReg && io.in.ready) {
+      beat := withReset(reset.asAsyncReset){ Mux(beat === (beats-1).U, 0.U, beat + 1.U) }
       when (beat < headerBeats.U) {
         withReset(reset.asAsyncReset){ channel_vec(header_idx) := bitsReg}
       }
     }
   }
 }
-
 class DecoupledFlitToCreditedFlit(flitWidth: Int, bufferSz: Int) extends Module {
   override def desiredName = s"DecoupledFlitToCreditedFlit_f${flitWidth}_b${bufferSz}"
 
@@ -272,6 +280,6 @@ class CreditedFlitToDecoupledFlit(flitWidth: Int, bufferSz: Int) extends Module 
 
   io.out <> buffer.io.deq
 
-  io.credit.valid := credits =/= 0.U
+  io.credit.valid := credits >= (1.U << (creditWidth - 2))
   io.credit.bits.flit := credits - 1.U
 }
