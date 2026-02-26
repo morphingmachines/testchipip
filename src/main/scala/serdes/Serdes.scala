@@ -160,8 +160,14 @@ class PhitArbiter(phitWidth: Int, flitWidth: Int, channels: Int) extends Module 
     val beats = headerBeats + flitBeats
     val beat = RegInit(0.U(log2Ceil(beats).W))
     val chosen_reg = Reg(UInt(headerWidth.W))
-    val chosen_prio = PriorityEncoder(io.in.map(_.valid))
-    val chosen = Mux(beat === 0.U, chosen_prio, chosen_reg)
+    val arbiter = Module(new RRArbiter(UInt(0.W), channels))
+    (0 until channels).foreach(i => {
+        arbiter.io.in(i).valid := io.in(i).valid
+        arbiter.io.in(i).bits  := DontCare
+      }
+    )
+    arbiter.io.out.ready := (beat === (beats-1).U) && io.out.ready
+    val chosen = Mux(beat === 0.U, arbiter.io.chosen, chosen_reg)
     val header_idx = if (headerBeats == 1) 0.U else beat(log2Ceil(headerBeats)-1,0)
 
     io.out.valid := VecInit(io.in.map(_.valid))(chosen)
@@ -175,7 +181,7 @@ class PhitArbiter(phitWidth: Int, flitWidth: Int, channels: Int) extends Module 
 
     when (io.out.fire) {
       beat := Mux(beat === (beats-1).U, 0.U, beat + 1.U)
-      when (beat === 0.U) { chosen_reg := chosen_prio }
+      when (beat === 0.U) { chosen_reg := arbiter.io.chosen }
     }
   }
 }
@@ -261,6 +267,6 @@ class CreditedFlitToDecoupledFlit(flitWidth: Int, bufferSz: Int) extends Module 
 
   io.out <> buffer.io.deq
 
-  io.credit.valid := credits =/= 0.U
+  io.credit.valid := (credits >= (bufferSz >> 2).U)
   io.credit.bits.flit := credits - 1.U
 }
