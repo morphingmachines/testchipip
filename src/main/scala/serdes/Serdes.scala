@@ -158,35 +158,24 @@ class PhitArbiter(phitWidth: Int, flitWidth: Int, channels: Int) extends Module 
     val headerBeats = (headerWidth - 1) / phitWidth + 1
     val flitBeats = (flitWidth - 1) / phitWidth + 1
     val beats = headerBeats + flitBeats
-    val beat =          withReset(reset.asAsyncReset) {RegInit(0.U(log2Ceil(beats).W)) }
-    val chosenReg =     withReset(reset.asAsyncReset) {RegInit(0.U(headerWidth.W)) }
-    val chosenFlitReg = withReset(reset.asAsyncReset) {RegInit(0.U(flitWidth.W)) }
-    val rrOutVldReg =   withReset(reset.asAsyncReset) {RegInit(0.U(1.W)) }
-    val OutVldReg =   withReset(reset.asAsyncReset) {RegInit(0.U(1.W)) }
-    val outBitsReg =    withReset(reset.asAsyncReset) {RegInit(0.U(flitWidth.W)) }
-    val rrOutVld =      Wire(UInt(1.W))
-    // Use Chisel's RRArbiter for round-robin selection
-    val rr_arb = Module(new RRArbiter(new Phit(phitWidth), channels))
-    rr_arb.io.in <> io.in
-    rrOutVld := Mux(beat < headerBeats.U, rr_arb.io.out.valid, rrOutVldReg) 
-    val chosen = Mux(beat < headerBeats.U, rr_arb.io.chosen, chosenReg)
+    val beat = RegInit(0.U(log2Ceil(beats).W))
+    val chosen_reg = Reg(UInt(headerWidth.W))
+    val chosen_prio = PriorityEncoder(io.in.map(_.valid))
+    val chosen = Mux(beat === 0.U, chosen_prio, chosen_reg)
     val header_idx = if (headerBeats == 1) 0.U else beat(log2Ceil(headerBeats)-1,0)
-    withReset(reset.asAsyncReset) {
-      chosenFlitReg := Mux(beat < headerBeats.U, rr_arb.io.out.bits.phit, chosenFlitReg)  
-      rrOutVldReg := rr_arb.io.out.valid
-      OutVldReg := rrOutVld
-      outBitsReg := Mux(beat < headerBeats.U,
-        chosen.asTypeOf(Vec(headerBeats, UInt(phitWidth.W)))(header_idx),
-        chosenFlitReg)
+
+    io.out.valid := VecInit(io.in.map(_.valid))(chosen)
+    io.out.bits.phit := Mux(beat < headerBeats.U,
+      chosen.asTypeOf(Vec(headerBeats, UInt(phitWidth.W)))(header_idx),
+      VecInit(io.in.map(_.bits.phit))(chosen))
+
+    for (i <- 0 until channels) {
+      io.in(i).ready := io.out.ready && beat >= headerBeats.U && chosen_reg === i.U
     }
-    io.out.valid := OutVldReg
-    io.out.bits.phit := outBitsReg
-    rr_arb.io.out.ready := io.out.ready && (beat < headerBeats.U)
-    withReset(reset.asAsyncReset) {
-      when (io.out.ready && (rrOutVld.asBool)) {
-        beat := withReset(reset.asAsyncReset){ Mux(beat === (beats-1).U, 0.U, beat + 1.U) }
-        when (beat === 0.U) { chosenReg := rr_arb.io.chosen }
-      }
+
+    when (io.out.fire) {
+      beat := Mux(beat === (beats-1).U, 0.U, beat + 1.U)
+      when (beat === 0.U) { chosen_reg := chosen_prio }
     }
   }
 }
@@ -204,34 +193,26 @@ class PhitDemux(phitWidth: Int, flitWidth: Int, channels: Int) extends Module {
     val headerBeats = (headerWidth - 1) / phitWidth + 1
     val flitBeats = (flitWidth - 1) / phitWidth + 1
     val beats = headerBeats + flitBeats
-    val beat = withReset(reset.asAsyncReset){RegInit(0.U(log2Ceil(beats).W)) }
-
-    require(headerBeats >= 1, "headerBeats must be at least 1")
-    // Initialize channel_vec with 0 and use async reset
-    val channel_vec = withReset(reset.asAsyncReset) { RegInit(VecInit(Seq.fill(math.max(headerBeats, 1))(0.U(phitWidth.W)))) }
-    //val channel_vec = Reg(Vec(math.max(headerBeats, 1), UInt(phitWidth.W)))
+    val beat = RegInit(0.U(log2Ceil(beats).W))
+    val channel_vec = Reg(Vec(headerBeats, UInt(phitWidth.W)))
     val channel = channel_vec.asUInt(log2Ceil(channels)-1,0)
     val header_idx = if (headerBeats == 1) 0.U else beat(log2Ceil(headerBeats)-1,0)
-    val validReg =withReset(reset.asAsyncReset) {RegInit(false.B)}
-    val bitsReg = withReset(reset.asAsyncReset) {RegInit(0.U(phitWidth.W))}
-    withReset(reset.asAsyncReset) {
-      validReg := io.in.valid
-      bitsReg := io.in.bits.phit
-    }
+
     io.in.ready := beat < headerBeats.U || VecInit(io.out.map(_.ready))(channel)
     for (c <- 0 until channels) {
-      io.out(c).valid := validReg && beat >= headerBeats.U && channel === c.U
-      io.out(c).bits.phit := bitsReg
+      io.out(c).valid := io.in.valid && beat >= headerBeats.U && channel === c.U
+      io.out(c).bits.phit := io.in.bits.phit
     }
 
-    when (validReg && io.in.ready) {
-      beat := withReset(reset.asAsyncReset){ Mux(beat === (beats-1).U, 0.U, beat + 1.U) }
+    when (io.in.fire) {
+      beat := Mux(beat === (beats-1).U, 0.U, beat + 1.U)
       when (beat < headerBeats.U) {
-        withReset(reset.asAsyncReset){ channel_vec(header_idx) := bitsReg}
+        channel_vec(header_idx) := io.in.bits.phit
       }
     }
   }
 }
+
 class DecoupledFlitToCreditedFlit(flitWidth: Int, bufferSz: Int) extends Module {
   override def desiredName = s"DecoupledFlitToCreditedFlit_f${flitWidth}_b${bufferSz}"
 
@@ -280,6 +261,6 @@ class CreditedFlitToDecoupledFlit(flitWidth: Int, bufferSz: Int) extends Module 
 
   io.out <> buffer.io.deq
 
-  io.credit.valid := credits >= (1.U << (creditWidth - 2))
+  io.credit.valid := credits =/= 0.U
   io.credit.bits.flit := credits - 1.U
 }
